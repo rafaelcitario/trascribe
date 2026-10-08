@@ -1,0 +1,216 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Gerador de legendas SRT</title>
+<style>
+:root{--bg:#e9eef2;--panel:#fff;--ink:#16222e;--mut:#5b6b7a;--line:#c9d3dc;--ac:#0b6e78;--ac2:#08545c}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 "Segoe UI",system-ui,sans-serif;padding:24px 16px 64px}
+main{max-width:760px;margin:0 auto}
+h1{font-size:28px;margin:0 0 4px;letter-spacing:-.01em}
+.sub{color:var(--mut);margin:0 0 24px}
+section{background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:18px;margin-bottom:14px}
+h2{font-size:16px;margin:0 0 12px}
+label.f{display:block;margin-bottom:12px;font-size:14px;color:var(--mut)}
+input[type=text],input[type=password],select,textarea{display:block;width:100%;margin-top:4px;padding:9px 10px;border:1px solid var(--line);border-radius:4px;font:inherit;color:var(--ink);background:#fff}
+textarea{min-height:110px;resize:vertical}
+.two{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:560px){.two{grid-template-columns:1fr}}
+button{font:inherit;font-weight:600;padding:11px 20px;border:0;border-radius:4px;background:var(--ac);color:#fff;cursor:pointer}
+button:hover{background:var(--ac2)}button:disabled{opacity:.5;cursor:wait}
+:focus-visible{outline:3px solid #f0b429;outline-offset:2px}
+#log{background:#14202b;color:#d7e3ec;font:13px/1.5 Consolas,monospace;padding:12px;border-radius:4px;white-space:pre-wrap;max-height:160px;overflow:auto;margin:14px 0 0}
+#log:empty{display:none}
+.row{display:flex;gap:10px;padding:8px 0;border-bottom:1px solid var(--line);font-size:14px}
+.row input{margin-top:5px}.row s{color:#a2432b}
+#out{min-height:260px;font:13px/1.45 Consolas,monospace}
+.muted,.note{color:var(--mut);font-size:13px}
+</style>
+</head>
+<body>
+<main>
+<h1>Gerador de legendas SRT</h1>
+<p class="sub">Arquivo mp3 ou mp4 vira legenda com tempo marcado. O roteiro corrige nomes e termos. Baixe este arquivo e abra direto no Chrome, pela pasta Downloads.</p>
+
+<section>
+<h2>Chaves gratuitas</h2>
+<div class="two">
+<label class="f">Chave da Groq (transcrição)
+<input type="password" id="gk" placeholder="gsk_..." autocomplete="off"></label>
+<label class="f">Chave do Google AI Studio (correção, opcional)
+<input type="password" id="mk" placeholder="AIza..." autocomplete="off"></label>
+</div>
+<p class="note">Crie a chave da Groq em console.groq.com e a do Gemini em aistudio.google.com. As chaves ficam salvas só neste navegador. O áudio vai para a Groq e o roteiro com as legendas vai para o Google; no plano gratuito esses dados podem ser usados pelas empresas.</p>
+</section>
+
+<section>
+<h2>Arquivo</h2>
+<label class="f">Áudio ou vídeo
+<input type="file" id="file" accept="audio/*,video/mp4,.mp3,.mp4,.m4a,.wav"></label>
+<div class="two">
+<label class="f">Modelo
+<select id="model"><option value="whisper-large-v3-turbo">Large v3 Turbo (mais rápido)</option><option value="whisper-large-v3">Large v3 (mais preciso)</option></select></label>
+<label class="f">Idioma
+<input type="text" id="lang" value="pt"></label>
+</div>
+<label class="f">Termos do canal (nomes, siglas, marcas), separados por vírgula
+<input type="text" id="gloss" placeholder="Ex.: Claude, Anthropic, WebGPU, transformers.js"></label>
+</section>
+
+<section>
+<h2>Roteiro (opcional)</h2>
+<label class="f">Cole o roteiro do vídeo para corrigir palavras e termos
+<textarea id="script"></textarea></label>
+<label class="f">Modelo Gemini
+<input type="text" id="gm" value="gemini-flash-latest"></label>
+</section>
+
+<button id="go">Gerar legenda</button>
+<pre id="log"></pre>
+
+<section id="res" hidden style="margin-top:18px">
+<h2>Correções sugeridas</h2>
+<div id="chg"></div>
+<h2 style="margin-top:20px">Arquivo SRT</h2>
+<textarea id="out" spellcheck="false"></textarea>
+<p><button id="dl">Baixar .srt</button></p>
+</section>
+</main>
+
+<script>
+const $=id=>document.getElementById(id);
+const log=m=>{$('log').textContent+=m+'\n';$('log').scrollTop=1e9};
+const esc=s=>s.replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+let cues=[];
+try{$('gk').value=localStorage.getItem('gk')||'';$('mk').value=localStorage.getItem('mk')||''}catch{}
+const save=()=>{try{localStorage.setItem('gk',$('gk').value);localStorage.setItem('mk',$('mk').value)}catch{}};
+
+async function toMono16k(file){
+  try{
+    const buf=await file.arrayBuffer();
+    const ac=new AudioContext({sampleRate:16000});
+    const dec=await ac.decodeAudioData(buf);ac.close();
+    const ch=dec.numberOfChannels,out=new Float32Array(dec.length);
+    for(let c=0;c<ch;c++){const d=dec.getChannelData(c);for(let i=0;i<out.length;i++)out[i]+=d[i]/ch}
+    return out;
+  }catch(e){throw new Error('Não consegui abrir o arquivo (formato ou tamanho). Extraia o áudio em MP3 e tente de novo.')}
+}
+function chunks(pcm,sr=16000,target=600){
+  const out=[];let st=0;
+  while(st<pcm.length){
+    let en=st+target*sr;
+    if(en>=pcm.length)en=pcm.length;
+    else{let best=en,bv=1e9;const w=6400;
+      for(let p=en-15*sr;p<en;p+=1600){let e=0;for(let i=p;i<p+w;i+=16)e+=Math.abs(pcm[i]||0);if(e<bv){bv=e;best=p+w/2}}
+      en=Math.min(Math.floor(best),en)}
+    out.push({start:st/sr,data:pcm.subarray(st,en)});st=en;
+  }
+  return out;
+}
+function wav(f,sr=16000){
+  const b=new ArrayBuffer(44+f.length*2),v=new DataView(b);
+  const w=(o,s)=>[...s].forEach((c,i)=>v.setUint8(o+i,c.charCodeAt(0)));
+  w(0,'RIFF');v.setUint32(4,36+f.length*2,true);w(8,'WAVEfmt ');v.setUint32(16,16,true);
+  v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,sr,true);v.setUint32(28,sr*2,true);
+  v.setUint16(32,2,true);v.setUint16(34,16,true);w(36,'data');v.setUint32(40,f.length*2,true);
+  for(let i=0;i<f.length;i++){const s=Math.max(-1,Math.min(1,f[i]));v.setInt16(44+i*2,s<0?s*32768:s*32767,true)}
+  return new Blob([b],{type:'audio/wav'});
+}
+function glossary(){
+  const sc=$('script').value,found=new Set(),re=/[A-ZÀ-Ý][\p{L}\p{N}'-]{2,}/gu;let m;
+  while((m=re.exec(sc))){
+    const before=sc.slice(0,m.index).replace(/[\s"“'(\[]+$/,'');
+    if(before&&!/[.!?:]$/.test(before))found.add(m[0]);
+  }
+  return [$('gloss').value.trim(),...found].filter(Boolean).join(', ').slice(0,600);
+}
+async function multipart(fields,file){
+  const bd='----srt'+Math.random().toString(16).slice(2),enc=new TextEncoder(),parts=[];
+  for(const [k,v] of fields)parts.push(enc.encode(`--${bd}\r\nContent-Disposition: form-data; name="${k}"\r\n\r\n${v}\r\n`));
+  parts.push(enc.encode(`--${bd}\r\nContent-Disposition: form-data; name="file"; filename="a.wav"\r\nContent-Type: audio/wav\r\n\r\n`));
+  parts.push(new Uint8Array(await file.arrayBuffer()));
+  parts.push(enc.encode(`\r\n--${bd}--\r\n`));
+  const type=`multipart/form-data; boundary=${bd}`;
+  return {body:new Blob(parts,{type}),type};
+}
+async function stt(blob){
+  for(let t=0;t<5;t++){
+    const fields=[['model',$('model').value],['response_format','verbose_json'],['timestamp_granularities[]','segment'],['language',$('lang').value.trim()||'pt'],['temperature','0']];
+    const g=glossary();if(g)fields.push(['prompt',g]);
+    const mp=await multipart(fields,blob);
+    const r=await fetch('https://api.groq.com/openai/v1/audio/transcriptions',{method:'POST',headers:{Authorization:'Bearer '+$('gk').value.trim(),'Content-Type':mp.type},body:mp.body});
+    if(r.ok)return r.json();
+    if(r.status===429){const w=+r.headers.get('retry-after')||30;log(`Limite do plano gratuito atingido. Aguardando ${w}s...`);await new Promise(x=>setTimeout(x,w*1000));continue}
+    throw new Error(`Groq ${r.status}: ${(await r.text()).slice(0,200)}`);
+  }
+  throw new Error('Limite do plano gratuito esgotado. Tente de novo mais tarde.');
+}
+function toCues(segs){
+  const out=[];
+  for(const s of segs){
+    const words=s.text.trim().split(/\s+/).filter(Boolean);if(!words.length)continue;
+    const gs=[];let cur=[];
+    for(const w of words){if(cur.join(' ').length+w.length+1>84&&cur.length){gs.push(cur);cur=[]}cur.push(w)}
+    if(cur.length)gs.push(cur);
+    const total=gs.reduce((a,g)=>a+g.join(' ').length,0);let t=s.start;
+    for(const g of gs){const txt=g.join(' ');const d=(s.end-s.start)*txt.length/total;out.push({s:t,e:t+d,t:txt});t+=d}
+  }
+  return out;
+}
+const wrap=t=>{if(t.length<=42)return t;const m=Math.round(t.length/2);let b=-1;
+  for(let d=0;d<t.length;d++){if(t[m-d]===' '){b=m-d;break}if(t[m+d]===' '){b=m+d;break}}
+  return b<0?t:t.slice(0,b)+'\n'+t.slice(b+1)};
+const ts=x=>{x=Math.max(0,x);const h=Math.floor(x/3600),m=Math.floor(x%3600/60),s=Math.floor(x%60),ms=Math.min(999,Math.round((x%1)*1000));
+  return [h,m,s].map(n=>String(n).padStart(2,'0')).join(':')+','+String(ms).padStart(3,'0')};
+
+async function fix(){
+  const script=$('script').value.trim(),model=$('gm').value.trim()||'gemini-flash-latest';
+  for(let b=0;b<cues.length;b+=100){
+    const part=cues.slice(b,b+100).map((c,i)=>({i:b+i,t:c.t}));
+    const prompt=`Você revisa legendas em português. Abaixo estão o ROTEIRO original do vídeo e um lote de legendas transcritas automaticamente. O locutor lê o roteiro quase literalmente. Para cada legenda, localize o trecho correspondente no roteiro; se a legenda difere dele por erro de reconhecimento de voz (palavra parecida, nome próprio, título, termo técnico, grafia, acentuação), use a forma exata do roteiro. Atenção: uma palavra que existe em português mas não faz sentido naquele ponto (por exemplo "Citar" no lugar do nome "Citário") também é erro e deve ser corrigida. Se o trecho não existe no roteiro (improviso), mantenha a legenda como está. Nunca mude o sentido nem reescreva frases por estilo. Responda somente com JSON: uma lista de {"i":número,"t":"texto corrigido"} contendo apenas as legendas que mudaram; lista vazia se nada mudou.\n\nROTEIRO:\n${script}\n\nLEGENDAS:\n${JSON.stringify(part)}`;
+    try{
+      const r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${$('mk').value.trim()}`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({contents:[{parts:[{text:prompt}]}],generationConfig:{responseMimeType:'application/json',temperature:0}})});
+      if(!r.ok){log(`Gemini ${r.status}: lote ${b/100+1} sem correção.`);continue}
+      const j=await r.json();const arr=JSON.parse(j.candidates[0].content.parts[0].text);
+      for(const x of arr){const c=cues[x.i];if(c&&typeof x.t==='string'&&x.t.trim()&&x.t.trim()!==c.t)c.n=x.t.trim()}
+    }catch(e){log(`Lote ${b/100+1}: resposta inválida, sem correção.`)}
+  }
+}
+function render(){
+  const ch=cues.map((c,i)=>({c,i})).filter(x=>x.c.n);
+  $('chg').innerHTML=ch.length?ch.map(({c,i})=>`<label class="row"><input type="checkbox" data-i="${i}" checked><span><s>${esc(c.t)}</s><br>${esc(c.n)}</span></label>`).join(''):'<p class="muted">Nenhuma correção sugerida.</p>';
+  upd();
+}
+function upd(){
+  const off=new Set([...document.querySelectorAll('#chg input:not(:checked)')].map(x=>+x.dataset.i));
+  $('out').value=cues.map((c,i)=>`${i+1}\n${ts(c.s)} --> ${ts(c.e)}\n${wrap(c.n&&!off.has(i)?c.n:c.t)}\n`).join('\n');
+}
+$('chg').onchange=upd;
+$('dl').onclick=()=>{
+  const f=$('file').files[0],name=(f?f.name.replace(/\.[^.]+$/,''):'legenda')+'.srt';
+  const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([$('out').value],{type:'text/plain'}));a.download=name;a.click();
+};
+$('go').onclick=async()=>{
+  const f=$('file').files[0];
+  if(!f)return alert('Escolha um arquivo mp3 ou mp4.');
+  if(!$('gk').value.trim())return alert('Cole a chave da Groq.');
+  save();$('go').disabled=true;$('log').textContent='';$('res').hidden=true;
+  try{
+    log('Lendo e convertendo o áudio...');
+    const pcm=await toMono16k(f),cs=chunks(pcm),segs=[];
+    for(let i=0;i<cs.length;i++){
+      log(`Transcrevendo parte ${i+1} de ${cs.length}...`);
+      const j=await stt(wav(cs[i].data));
+      for(const s of j.segments||[]){if(s.no_speech_prob>0.8)continue;segs.push({start:s.start+cs[i].start,end:s.end+cs[i].start,text:s.text})}
+    }
+    cues=toCues(segs);
+    if($('script').value.trim()&&$('mk').value.trim()){log('Corrigindo termos com o roteiro...');await fix();log(`${cues.filter(c=>c.n).length} correções sugeridas.`)}
+    render();$('res').hidden=false;log(`Pronto: ${cues.length} legendas.`);
+  }catch(e){log('Erro: '+e.message)}
+  $('go').disabled=false;
+};
+</script>
+</body>
+</html>
